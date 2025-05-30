@@ -27,12 +27,12 @@ impl Default for Config {
             attempts: 3,
             keywords: "大连理工大学开发区校区".to_string(),
             city: "大连".to_string(),
-            api_key: "1a3d892d650f273ea24b3e2be9beea00".to_string(),
+            api_key: "".to_string(),
             output_file: "response_log.json".to_string(),
             food_radius: 1000,
             food_types: "050000".to_string(),
             max_food_results: 5,
-            qwen_api_key: "sk-f05ef9cd88fd436ea4be2b2e3edae7f4".to_string(),
+            qwen_api_key: "".to_string(),
             qwen_model: "qwen3-235b-a22b".to_string(),
         }
     }
