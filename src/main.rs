@@ -1,9 +1,15 @@
 use serde::{Deserialize, Serialize};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use std::{error::Error, fs, time::Duration, process};
 use chrono::Local;
 use serde_json::{Value, json};
 use colored::*;
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, middleware, get, post};
+use std::sync::Arc;
+use actix_web_lab::sse::{self, Sse};
+use futures::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Config {
@@ -27,12 +33,12 @@ impl Default for Config {
             attempts: 3,
             keywords: "大连理工大学开发区校区".to_string(),
             city: "大连".to_string(),
-            api_key: "".to_string(),
+            api_key: "1a3d892d650f273ea24b3e2be9beea00".to_string(),
             output_file: "response_log.json".to_string(),
             food_radius: 1000,
             food_types: "050000".to_string(),
             max_food_results: 5,
-            qwen_api_key: "".to_string(),
+            qwen_api_key: "sk-f05ef9cd88fd436ea4be2b2e3edae7f4".to_string(),
             qwen_model: "qwen3-235b-a22b".to_string(),
         }
     }
@@ -58,7 +64,7 @@ fn load_config() -> Result<Config, Box<dyn Error>> {
     }
 }
 
-fn get_location(client: &Client, config: &Config) -> Result<(f64, f64), Box<dyn Error>> {
+async fn get_location(client: &Client, config: &Config) -> Result<(f64, f64), Box<dyn Error>> {
     let mut url = reqwest::Url::parse("https://restapi.amap.com/v3/assistant/inputtips")?;
     url.query_pairs_mut()
         .append_pair("key", &config.api_key)
@@ -69,13 +75,14 @@ fn get_location(client: &Client, config: &Config) -> Result<(f64, f64), Box<dyn 
 
     let response = client.get(url.clone())
         .header("User-Agent", &format!("{}-geo-service", config.username))
-        .send()?;
+        .send()
+        .await?;
 
     if !response.status().is_success() {
         return Err(format!("定位API失败: {}", response.status()).into());
     }
 
-    let body = response.text()?;
+    let body = response.text().await?;
     let data: Value = serde_json::from_str(&body)?;
 
     if let Some(tips) = data["tips"].as_array() {
@@ -100,7 +107,7 @@ fn get_location(client: &Client, config: &Config) -> Result<(f64, f64), Box<dyn 
     Err("无法解析坐标，请检查API响应结构".into())
 }
 
-fn search_food(client: &Client, config: &Config, location: (f64, f64)) -> Result<Value, Box<dyn Error>> {
+async fn search_food(client: &Client, config: &Config, location: (f64, f64)) -> Result<Value, Box<dyn Error>> {
     let (longitude, latitude) = location;
     let location_str = format!("{},{}", longitude, latitude);
 
@@ -121,13 +128,14 @@ fn search_food(client: &Client, config: &Config, location: (f64, f64)) -> Result
 
     let response = client.get(url)
         .header("User-Agent", &format!("{}-food-service", config.username))
-        .send()?;
+        .send()
+        .await?;
 
     if !response.status().is_success() {
         return Err(format!("美食搜索API失败: {}", response.status()).into());
     }
 
-    let body = response.text()?;
+    let body = response.text().await?;
     let data: Value = serde_json::from_str(&body)?;
     Ok(data)
 }
@@ -191,7 +199,7 @@ struct QwenChoice {
     message: QwenMessage,
 }
 
-fn ask_qwen(prompt: &str, config: &Config) -> Result<String, Box<dyn Error>> {
+async fn ask_qwen(prompt: &str, config: &Config) -> Result<String, Box<dyn Error>> {
     let client = Client::new();
     let url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 
@@ -219,15 +227,16 @@ fn ask_qwen(prompt: &str, config: &Config) -> Result<String, Box<dyn Error>> {
         .header("Authorization", format!("Bearer {}", config.qwen_api_key))
         .header("Content-Type", "application/json")
         .json(&request)
-        .send()?;
+        .send()
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text()?;
+        let body = response.text().await?;
         return Err(format!("AI调用失败 ({}): {}", status, body).into());
     }
 
-    let response_body = response.text()?;
+    let response_body = response.text().await?;
     println!("🔍 AI原始响应: {}", response_body);  // 调试输出
 
     // 尝试解析响应
@@ -251,16 +260,24 @@ fn ask_qwen(prompt: &str, config: &Config) -> Result<String, Box<dyn Error>> {
     }
 }
 
-fn generate_ai_prompt(food_data: &Value, config: &Config) -> String {
+fn generate_ai_prompt(food_data: &Value, location: &str) -> String {
     let mut prompt = String::new();
 
     prompt.push_str(&format!(
-        "用户位置：{}（{}）\n",
-        config.keywords, config.city
+        "用户位置：{}\n",
+        location
     ));
+    
+    // 从food_data中提取搜索半径
+    let radius = if let Some(radius) = food_data["radius"].as_str() {
+        radius
+    } else {
+        "1000" // 默认值
+    };
+    
     prompt.push_str(&format!(
         "搜索范围：半径{}米\n\n",
-        config.food_radius
+        radius
     ));
 
     if let Some(pois) = food_data["pois"].as_array() {
@@ -289,25 +306,207 @@ fn generate_ai_prompt(food_data: &Value, config: &Config) -> String {
     prompt
 }
 
-fn main() {
-    println!("\n{}{}", "🗺️ 智能地理分析系统 ".bold().blue(), "v2.0".yellow());
-    println!("{}", "=".repeat(40).dimmed());
-    println!("{}", "集成高德地图API + 通义千问AI".bold());
+// API请求结构体定义
+#[derive(Deserialize)]
+struct LocationRequest {
+    location: String,
+    city: Option<String>,
+}
 
+// API响应结构体定义
+#[derive(Serialize)]
+struct ApiResponse {
+    success: bool,
+    message: String,
+    data: Option<Value>,
+    error: Option<String>,
+}
+
+// 处理API请求的函数
+#[post("/api/ai")]
+async fn food_recommendation_api(
+    app_data: web::Data<AppState>,
+    req: web::Json<LocationRequest>,
+) -> impl Responder {
+    let config = app_data.config.clone();
+    let client = app_data.client.clone();
+    
+    // 创建一个可修改的配置副本
+    let mut config_clone = (*config).clone();
+    
+    // 使用请求中的位置信息
+    if !req.location.is_empty() {
+        config_clone.keywords = req.location.clone();
+        println!("📍 使用请求位置: {}", config_clone.keywords.green());
+    }
+    
+    // 获取地点坐标
+    let location = match get_location(&client, &config_clone).await {
+        Ok(loc) => loc,
+        Err(e) => {
+            return web::Json(ApiResponse {
+                success: false,
+                message: "Failed to get location coordinates".to_string(),
+                data: None,
+                error: Some(e.to_string()),
+            });
+        }
+    };
+    
+    // 搜索附近美食
+    let food_data = match search_food(&client, &config_clone, location).await {
+        Ok(data) => data,
+        Err(e) => {
+            return web::Json(ApiResponse {
+                success: false,
+                message: "Failed to search for food".to_string(),
+                data: None,
+                error: Some(e.to_string()),
+            });
+        }
+    };
+    
+    // 生成AI提示并调用AI进行分析
+    let ai_prompt = generate_ai_prompt(&food_data, &config_clone.keywords);
+    let ai_response = match ask_qwen(&ai_prompt, &config_clone).await {
+        Ok(response) => Some(response),
+        Err(_) => {
+            // 尝试备用模型
+            let mut backup_config = config_clone.clone();
+            backup_config.qwen_model = "qwen-turbo".to_string();
+            
+            match ask_qwen(&ai_prompt, &backup_config).await {
+                Ok(response) => Some(response),
+                Err(_) => None,
+            }
+        }
+    };
+    
+    // 构建响应
+    web::Json(ApiResponse {
+        success: ai_response.is_some(),
+        message: if ai_response.is_some() {
+            "Food recommendations generated successfully".to_string()
+        } else {
+            "Failed to generate AI recommendations".to_string()
+        },
+        data: if let Some(ref recommendation) = ai_response {
+            Some(json!({
+                "location": config_clone.keywords,
+                "coordinates": location,
+                "food_data": food_data,
+                "recommendation": recommendation,
+                "config": config_clone,
+            }))
+        } else {
+            None
+        },
+        error: if ai_response.is_none() {
+            Some("Failed to get AI response from both primary and backup models".to_string())
+        } else {
+            None
+        },
+    })
+}
+
+// 只返回AI生成的内容API
+#[post("/api/ai/content")]
+async fn ai_content_only(
+    app_data: web::Data<AppState>,
+    req: web::Json<LocationRequest>,
+) -> impl Responder {
+    let config = app_data.config.clone();
+    let client = app_data.client.clone();
+    
+    // 创建一个可修改的配置副本
+    let mut config_clone = (*config).clone();
+    
+    // 使用请求中的位置信息
+    if !req.location.is_empty() {
+        config_clone.keywords = req.location.clone();
+        println!("📍 使用请求位置: {}", config_clone.keywords.green());
+    }
+    
+    // 获取地点坐标
+    let location = match get_location(&client, &config_clone).await {
+        Ok(loc) => loc,
+        Err(e) => {
+            return HttpResponse::BadRequest().body(format!("获取位置坐标失败: {}", e));
+        }
+    };
+    
+    // 搜索附近美食
+    let food_data = match search_food(&client, &config_clone, location).await {
+        Ok(data) => data,
+        Err(e) => {
+            return HttpResponse::InternalServerError().body(format!("搜索美食失败: {}", e));
+        }
+    };
+    
+    // 生成AI提示并调用AI进行分析
+    let ai_prompt = generate_ai_prompt(&food_data, &config_clone.keywords);
+    let ai_response = match ask_qwen(&ai_prompt, &config_clone).await {
+        Ok(response) => Some(response),
+        Err(_) => {
+            // 尝试备用模型
+            let mut backup_config = config_clone.clone();
+            backup_config.qwen_model = "qwen-turbo".to_string();
+            
+            match ask_qwen(&ai_prompt, &backup_config).await {
+                Ok(response) => Some(response),
+                Err(_) => None,
+            }
+        }
+    };
+    
+    // 只返回AI生成的内容
+    match ai_response {
+        Some(content) => HttpResponse::Ok().content_type("text/plain; charset=utf-8").body(content),
+        None => HttpResponse::InternalServerError().body("无法获取AI推荐内容")
+    }
+}
+
+// 健康检查API
+#[get("/health")]
+async fn health_check() -> impl Responder {
+    HttpResponse::Ok().json(json!({
+        "status": "ok",
+        "service": "food-recommendation-api",
+        "version": "1.0.0",
+        "timestamp": Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }))
+}
+
+// 应用状态结构体
+struct AppState {
+    config: Arc<Config>,
+    client: Client,
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // 初始化日志
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    
+    println!("\n{}{}", "🗺️ 智能地理分析系统 ".bold().blue(), "v3.0".yellow());
+    println!("{}", "=".repeat(40).dimmed());
+    println!("{}", "集成高德地图API + 通义千问AI + Web API".bold());
+    
+    // 加载配置
     let config = match load_config() {
-        Ok(cfg) => cfg,
+        Ok(cfg) => Arc::new(cfg),
         Err(e) => {
             println!("❌ 配置加载失败: {}", e);
             process::exit(1);
         }
     };
-
+    
     println!("\n🔧 配置加载成功");
     println!("👤 用户: {}", config.username.green());
-    println!("📍 目标地点: {}", config.keywords.green());
-    println!("🏙️ 城市: {}", config.city.green());
+    println!("🏙️ 默认城市: {}", config.city.green());
     println!("🤖 AI模型: {}", config.qwen_model.green());
-
+    
+    // 创建HTTP客户端
     let client = match Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -318,71 +517,218 @@ fn main() {
             process::exit(1);
         }
     };
+    
+    // 创建应用状态
+    let app_state = web::Data::new(AppState {
+        config: config.clone(),
+        client,
+    });
+    
+    // 启动Web服务器
+    println!("\n🚀 启动Web API服务...");
+    println!("📡 监听地址: http://127.0.0.1:8080");
+    println!("🔌 完整数据API: http://127.0.0.1:8080/api/ai");
+    println!("📝 纯文本API: http://127.0.0.1:8080/api/ai/content");
+    println!("📊 流式API: http://127.0.0.1:8080/api/ai/stream");
+    println!("🩺 健康检查: http://127.0.0.1:8080/health");
+    
+    HttpServer::new(move || {
+        App::new()
+            .app_data(app_state.clone())
+            .wrap(middleware::Logger::default())
+            .wrap(
+                middleware::DefaultHeaders::new()
+                    .add(("Access-Control-Allow-Origin", "*"))
+                    .add(("Access-Control-Allow-Methods", "GET, POST, OPTIONS"))
+                    .add(("Access-Control-Allow-Headers", "Content-Type, Authorization"))
+            )
+            .service(food_recommendation_api)
+            .service(ai_content_only)
+            /*.service(ai_stream)*/
+            .service(health_check)
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
+}
+/*use futures::stream::{self, StreamExt}; // 添加这个导入
+use actix_web::web::Bytes;  // 添加这个导入
+// 自定义SSE流结构体
+struct SseMessageStream {
+    chunks: Vec<String>,
+    current: usize,
+    end_sent: bool, // 标记是否已发送结束事件
+}
 
-    // 第一步：获取地点坐标
-    let location = match get_location(&client, &config) {
+impl SseMessageStream {
+    fn new(content: String) -> Self {
+        // 将内容按行分割成多个块，过滤空行
+        let chunks = content
+            .split('\n')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>();
+
+        SseMessageStream {
+            chunks,
+            current: 0,
+            end_sent: false,
+        }
+    }
+}
+
+impl Stream for SseMessageStream {
+    type Item = Result<sse::Event, actix_web::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+
+        if this.current < this.chunks.len() {
+            // 获取当前块并构造JSON响应
+            let chunk = &this.chunks[this.current];
+            let json_data = serde_json::json!({
+                "type": "chunk",
+                "content": chunk
+            }).to_string();
+
+            // 移动到下一块
+            this.current += 1;
+
+            // 返回当前块作为SSE事件
+            Poll::Ready(Some(Ok(sse::Event::Data(sse::Data::new(json_data)))))
+        } else if !this.end_sent {
+            // 发送结束标记
+            this.end_sent = true;
+            let end_event = sse::Event::Data(sse::Data::new(
+                serde_json::json!({
+                    "type": "end",
+                    "content": "stream_completed"
+                }).to_string()
+            ));
+            Poll::Ready(Some(Ok(end_event)))
+        } else {
+            // 所有块都已发送，流结束
+            Poll::Ready(None)
+        }
+    }
+}
+
+// SSE流式API接口
+#[post("/api/ai/stream")]
+async fn ai_stream(
+    app_data: web::Data<AppState>,
+    req: web::Json<LocationRequest>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let config = app_data.config.clone();
+    let client = app_data.client.clone();
+
+    // 创建一个可修改的配置副本
+    let mut config_clone = (*config).clone();
+
+    // 使用请求中的位置信息
+    if !req.location.is_empty() {
+        config_clone.keywords = req.location.clone();
+        println!("📍 使用请求位置: {}", config_clone.keywords.green());
+    }
+
+    // 获取地点坐标
+    let location = match get_location(&client, &config_clone).await {
         Ok(loc) => loc,
         Err(e) => {
-            println!("❌ 地点查询失败: {}", e);
-            println!("💡 建议: 检查地点名称是否正确或尝试更换关键词");
-            process::exit(1);
+            // 创建错误消息的 SSE 格式字符串
+            let error_message = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                "type": "error",
+                "content": format!("获取位置坐标失败: {}", e)
+            })
+            );
+
+            // 转换为 Bytes
+            let bytes = Bytes::from(error_message);
+
+            // 创建单个事件的流
+            return Ok(HttpResponse::BadRequest()
+                .content_type("text/event-stream")
+                .streaming(stream::once(async { Ok(bytes) })));
         }
     };
 
-    // 第二步：搜索附近美食
-    let food_data = match search_food(&client, &config, location) {
+    // 搜索附近美食
+    let food_data = match search_food(&client, &config_clone, location).await {
         Ok(data) => data,
         Err(e) => {
-            println!("❌ 美食搜索失败: {}", e);
-            process::exit(1);
+            let error_message = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                "type": "error",
+                "content": format!("搜索美食失败: {}", e)
+            })
+            );
+            let bytes = Bytes::from(error_message);
+
+            return Ok(HttpResponse::InternalServerError()
+                .content_type("text/event-stream")
+                .streaming(stream::once(async { Ok(bytes) })));
         }
     };
 
-    println!("{}", format_food_results(&food_data));
+    // 生成AI提示并调用AI进行分析
+    let ai_prompt = generate_ai_prompt(&food_data, &config_clone.keywords);
 
-    // 第三步：调用AI进行分析
-    let ai_prompt = generate_ai_prompt(&food_data, &config);
+    // 尝试主模型
+    let mut ai_response = ask_qwen(&ai_prompt, &config_clone).await;
 
-    // 尝试使用兼容模式
-    println!("\n🚀 尝试兼容模式调用...");
-    match ask_qwen(&ai_prompt, &config) {
-        Ok(ai_response) => {
-            println!("\n{}", "🌟 AI美食推荐分析:".bold().purple());
-            println!("{}", ai_response);
-        }
+    // 如果主模型失败，尝试备用模型
+    if ai_response.is_err() {
+        let mut backup_config = config_clone.clone();
+        backup_config.qwen_model = "qwen-turbo".to_string();
+        ai_response = ask_qwen(&ai_prompt, &backup_config).await;
+    }
+
+    // 返回AI生成的内容作为SSE流
+    match ai_response {
+        Ok(content) => {
+            // 将内容分割成行
+            let lines: Vec<String> = content.split('\n')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            // 创建事件流
+            let stream = futures::stream::iter(lines.into_iter().map(|line| {
+                let json_data = serde_json::json!({
+                "type": "chunk",
+                "content": line
+            }).to_string();
+                Ok(Bytes::from(format!("data: {}\n\n", json_data)))
+            }))
+                .chain(futures::stream::once(async {
+                    let end_event = serde_json::json!({
+                "type": "end",
+                "content": "stream_completed"
+            }).to_string();
+                    Ok(Bytes::from(format!("data: {}\n\n", end_event)))
+                }));
+
+            Ok(HttpResponse::Ok()
+                .content_type("text/event-stream")
+                .streaming(stream))
+        },
+        // AI调用失败处理
         Err(e) => {
-            println!("❌ AI分析失败: {}", e);
-            println!("💡 尝试备用方案: 使用qwen-turbo模型");
+            let error_message = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                "type": "error",
+                "content": format!("无法获取AI推荐内容: {}", e)
+            })
+            );
+            let bytes = Bytes::from(error_message);
 
-            // 尝试备用模型
-            let mut backup_config = config.clone();
-            backup_config.qwen_model = "qwen-turbo".to_string();
-
-            match ask_qwen(&ai_prompt, &backup_config) {
-                Ok(ai_response) => {
-                    println!("\n{}", "🌟 AI美食推荐分析(备用模型):".bold().purple());
-                    println!("{}", ai_response);
-                }
-                Err(e) => {
-                    println!("❌ 备用模型也失败: {}", e);
-                }
-            }
+            Ok(HttpResponse::InternalServerError()
+                .content_type("text/event-stream")
+                .streaming(stream::once(async { Ok(bytes) })))
         }
     }
-
-    // 保存结果到文件
-    let output = json!({
-        "search_time": Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        "config": config,
-        "food_results": food_data,
-        "ai_prompt": ai_prompt
-    });
-
-    if let Err(e) = fs::write(&config.output_file, serde_json::to_string_pretty(&output).unwrap()) {
-        println!("⚠️ 结果保存失败: {}", e);
-    } else {
-        println!("\n💾 完整结果已保存到: {}", config.output_file.green());
-    }
-
-    println!("\n⏰ 执行完成时间: {}", Local::now().format("%Y-%m-%d %H:%M:%S").to_string().cyan());
-}
+}*/
