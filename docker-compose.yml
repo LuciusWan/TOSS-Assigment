@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  food-recommendation-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: food-api
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+      - ACTIX_WEB_BIND=0.0.0.0:8080
+    volumes:
+      # 如果需要持久化配置文件，可以挂载
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - food-api-network
+
+networks:
+  food-api-network:
+    driver: bridge

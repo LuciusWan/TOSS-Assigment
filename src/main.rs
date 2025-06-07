@@ -350,6 +350,19 @@ struct LocationRequest {
     city: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct ApiRequest {
+    message: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MapRequest {
+    location: String,
+    zoom: Option<u8>,
+    size: Option<String>,
+    markers: Option<Vec<String>>,
+}
+
 // API响应结构体定义
 #[derive(Serialize)]
 struct ApiResponse {
@@ -357,6 +370,16 @@ struct ApiResponse {
     message: String,
     data: Option<Value>,
     error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MapResponse {
+    status: String,
+    map_url: Option<String>,
+    location: Option<String>,
+    coordinates: Option<(f64, f64)>,
+    message: String,
+    timestamp: String,
 }
 
 // 处理API请求的函数
@@ -503,6 +526,107 @@ async fn ai_content_only(
     }
 }
 
+// 地图API - 获取指定地点的静态地图
+#[post("/api/map")]
+async fn get_map_api(req: web::Json<MapRequest>, data: web::Data<AppState>) -> Result<HttpResponse, actix_web::Error> {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    
+    // 获取地点坐标
+    let coordinates = match get_location_for_map(&data.client, &data.config, &req.location).await {
+        Ok(coords) => coords,
+        Err(e) => {
+            let error_response = MapResponse {
+                status: "error".to_string(),
+                map_url: None,
+                location: Some(req.location.clone()),
+                coordinates: None,
+                message: format!("获取地点坐标失败: {}", e),
+                timestamp,
+            };
+            return Ok(HttpResponse::BadRequest().json(error_response));
+        }
+    };
+    
+    // 生成静态地图URL
+    let map_url = generate_static_map_url(&data.config, coordinates, &req);
+    
+    let response = MapResponse {
+        status: "success".to_string(),
+        map_url: Some(map_url),
+        location: Some(req.location.clone()),
+        coordinates: Some(coordinates),
+        message: "地图生成成功".to_string(),
+        timestamp,
+    };
+    
+    Ok(HttpResponse::Ok().json(response))
+}
+
+// 获取地点坐标的辅助函数
+async fn get_location_for_map(client: &Client, config: &Config, location: &str) -> Result<(f64, f64), Box<dyn Error>> {
+    let mut url = reqwest::Url::parse("https://restapi.amap.com/v3/assistant/inputtips")?;
+    url.query_pairs_mut()
+        .append_pair("key", &config.api_key)
+        .append_pair("keywords", location)
+        .append_pair("city", &config.city);
+
+    let response = client.get(url.clone())
+        .header("User-Agent", &format!("{}-map-service", config.username))
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("地图定位API失败: {}", response.status()).into());
+    }
+
+    let body = response.text().await?;
+    let data: Value = serde_json::from_str(&body)?;
+
+    if let Some(tips) = data["tips"].as_array() {
+        if tips.is_empty() {
+            return Err("未找到相关地点".into());
+        }
+
+        // 获取第一个有效位置
+        for tip in tips {
+            if let Some(location) = tip["location"].as_str() {
+                let coords: Vec<&str> = location.split(',').collect();
+                if coords.len() == 2 {
+                    let longitude = coords[0].parse::<f64>()?;
+                    let latitude = coords[1].parse::<f64>()?;
+                    return Ok((longitude, latitude));
+                }
+            }
+        }
+    }
+    
+    Err("无法解析地点坐标".into())
+}
+
+// 生成高德静态地图URL
+fn generate_static_map_url(config: &Config, coordinates: (f64, f64), req: &MapRequest) -> String {
+    let (longitude, latitude) = coordinates;
+    
+    // 默认参数
+    let zoom = req.zoom.unwrap_or(15); // 默认缩放级别
+    let size = req.size.as_deref().unwrap_or("400*300"); // 默认尺寸
+    
+    // 构建基础URL
+    let mut url = format!(
+        "https://restapi.amap.com/v3/staticmap?location={},{}&zoom={}&size={}&markers=mid,,A:{},{}&key={}",
+        longitude, latitude, zoom, size, longitude, latitude, config.api_key
+    );
+    
+    // 添加额外的标记点（如果有）
+    if let Some(markers) = &req.markers {
+        for marker in markers {
+            url.push_str(&format!("&markers={}", marker));
+        }
+    }
+    
+    url
+}
+
 // 健康检查API
 #[get("/health")]
 async fn health_check() -> Result<HttpResponse, actix_web::Error> {
@@ -566,6 +690,7 @@ async fn main() -> std::io::Result<()> {
     println!("📡 监听地址: http://127.0.0.1:8080");
     println!("🔌 完整数据API: http://127.0.0.1:8080/api/ai");
     println!("📝 纯文本API: http://127.0.0.1:8080/api/ai/content");
+    println!("🗺️ 地图API: http://127.0.0.1:8080/api/map");
     println!("🩺 健康检查: http://127.0.0.1:8080/health");
     
     HttpServer::new(move || {
@@ -573,6 +698,7 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::default()
             .allowed_origin("http://localhost:5173")  // 允许前端域名
             .allowed_origin("http://127.0.0.1:5173") // 也允许 127.0.0.1
+            .allowed_origin("http://121.40.25.117") // 允许前端域名
             .allowed_origin("http://localhost:3000")  // 常见的React开发端口
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
             .allowed_headers(vec!["Content-Type", "Authorization"])
@@ -584,6 +710,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(middleware::Logger::default())
             .service(food_recommendation_api)
             .service(ai_content_only)
+            .service(get_map_api)
             .service(health_check)
     })
     .bind("127.0.0.1:8080")?
