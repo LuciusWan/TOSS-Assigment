@@ -1,0 +1,33 @@
+# Rust 构建产物
+target/
+Cargo.lock
+
+# IDE 文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# 文档
+README.md
+*.md
+
+# 临时文件
+*.tmp
+*.temp
+
+# 日志文件
+*.log
+
+# 其他
+rustup-init.exe
+dependency_graph.dot

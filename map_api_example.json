@@ -1,0 +1,96 @@
+{
+  "map_api_examples": {
+    "basic_request": {
+      "url": "http://127.0.0.1:8080/api/map",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "location": "大连理工大学开发区校区"
+      }
+    },
+    "advanced_request": {
+      "url": "http://127.0.0.1:8080/api/map",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "location": "大连理工大学开发区校区",
+        "zoom": 16,
+        "size": "600*400",
+        "markers": [
+          "large,0xFF0000,A:116.481485,39.990464",
+          "mid,0x00FF00,B:116.481485,39.991464"
+        ]
+      }
+    },
+    "restaurant_map": {
+      "url": "http://127.0.0.1:8080/api/map",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "location": "海底捞火锅(大连开发区万达店)",
+        "zoom": 18,
+        "size": "800*600"
+      }
+    }
+  },
+  "curl_examples": {
+    "basic_curl": "curl -X POST http://127.0.0.1:8080/api/map -H \"Content-Type: application/json\" -d '{\"location\": \"大连理工大学开发区校区\"}'",
+    "advanced_curl": "curl -X POST http://127.0.0.1:8080/api/map -H \"Content-Type: application/json\" -d '{\"location\": \"大连理工大学开发区校区\", \"zoom\": 16, \"size\": \"600*400\"}'"
+  },
+  "response_format": {
+    "success_response": {
+      "status": "success",
+      "map_url": "https://restapi.amap.com/v3/staticmap?location=121.766007,39.052395&zoom=15&size=400*300&markers=mid,,A:121.766007,39.052395&key=YOUR_API_KEY",
+      "location": "大连理工大学开发区校区",
+      "coordinates": [121.766007, 39.052395],
+      "message": "地图生成成功",
+      "timestamp": "2024-01-15 14:30:25"
+    },
+    "error_response": {
+      "status": "error",
+      "map_url": null,
+      "location": "不存在的地点",
+      "coordinates": null,
+      "message": "获取地点坐标失败: 未找到相关地点",
+      "timestamp": "2024-01-15 14:30:25"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "required": true,
+      "description": "要查询的地点名称或地址"
+    },
+    "zoom": {
+      "type": "integer",
+      "required": false,
+      "default": 15,
+      "range": "3-18",
+      "description": "地图缩放级别，数值越大显示越详细"
+    },
+    "size": {
+      "type": "string",
+      "required": false,
+      "default": "400*300",
+      "format": "width*height",
+      "max_size": "1024*1024",
+      "description": "地图图片尺寸"
+    },
+    "markers": {
+      "type": "array",
+      "required": false,
+      "description": "额外的标记点，格式: size,color,label:longitude,latitude",
+      "examples": [
+        "large,0xFF0000,A:116.481485,39.990464",
+        "mid,0x00FF00,B:116.481485,39.991464",
+        "small,0x0000FF,C:116.481485,39.992464"
+      ]
+    }
+  }
+}
