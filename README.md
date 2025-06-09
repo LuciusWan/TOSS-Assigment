@@ -3,6 +3,8 @@
 ## 项目概述
 
 本项目是一个基于 Rust 开发的智能地理美食推荐系统，集成了高德地图 API 和通义千问 AI 模型，提供位置查询、美食搜索、AI 智能推荐和地图可视化等功能。系统采用 RESTful API 架构，支持跨平台部署和 Docker 容器化。
+[前端工程地址](https://github.com/LuciusWan/TOSS-FrontEnd)
+
 
 ## 技术栈
 
