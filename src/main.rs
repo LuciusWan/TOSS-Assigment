@@ -347,7 +347,7 @@ fn generate_ai_prompt(food_data: &Value, location: &str) -> String {
 #[derive(Deserialize)]
 struct LocationRequest {
     location: String,
-    city: Option<String>,
+    /*city: Option<String>,*/
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -382,9 +382,77 @@ struct MapResponse {
     timestamp: String,
 }
 
-// 处理API请求的函数
-#[post("/api/ai")]
-async fn food_recommendation_api(
+// 位置信息和美食数据接口
+#[post("/api/location-food")]
+async fn location_food_api(
+    app_data: web::Data<AppState>,
+    req: web::Json<LocationRequest>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let config = app_data.config.clone();
+    let client = app_data.client.clone();
+    
+    // 创建一个可修改的配置副本
+    let mut config_clone = (*config).clone();
+    
+    // 使用请求中的位置信息
+    if !req.location.is_empty() {
+        config_clone.keywords = req.location.clone();
+        println!("📍 使用请求位置: {}", config_clone.keywords.green());
+    }
+    
+    // 获取地点坐标
+    let location = match get_location(&client, &config_clone).await {
+        Ok(loc) => loc,
+        Err(e) => {
+            return Ok(HttpResponse::BadRequest().json(ApiResponse {
+                success: false,
+                message: "Failed to get location coordinates".to_string(),
+                data: None,
+                error: Some(e.to_string()),
+            }));
+        }
+    };
+    
+    // 搜索附近美食
+    let food_data = match search_food(&client, &config_clone, location).await {
+        Ok(data) => data,
+        Err(e) => {
+            return Ok(HttpResponse::InternalServerError().json(ApiResponse {
+                success: false,
+                message: "Failed to search for food".to_string(),
+                data: None,
+                error: Some(e.to_string()),
+            }));
+        }
+    };
+    
+    // 构建响应 - 只返回位置信息和美食数据
+    Ok(HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: "Location and food data retrieved successfully".to_string(),
+        data: Some(json!({
+            "location_info": {
+                "name": config_clone.keywords,
+                "coordinates": {
+                    "longitude": location.0,
+                    "latitude": location.1
+                }
+            },
+            "food_data": food_data,
+            "search_config": {
+                "radius": config_clone.food_radius,
+                "max_results": config_clone.max_food_results,
+                "food_types": config_clone.food_types,
+                "sort_by": "distance"
+            }
+        })),
+        error: None,
+    }))
+}
+
+// AI推荐内容接口
+#[post("/api/ai-recommendation")]
+async fn ai_recommendation_api(
     app_data: web::Data<AppState>,
     req: web::Json<LocationRequest>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -442,21 +510,17 @@ async fn food_recommendation_api(
         }
     };
     
-    // 构建响应
+    // 构建响应 - 只返回AI推荐内容
     Ok(HttpResponse::Ok().json(ApiResponse {
         success: ai_response.is_some(),
         message: if ai_response.is_some() {
-            "Food recommendations generated successfully".to_string()
+            "AI recommendation generated successfully".to_string()
         } else {
             "Failed to generate AI recommendations".to_string()
         },
         data: if let Some(ref recommendation) = ai_response {
             Some(json!({
-                "location": config_clone.keywords,
-                "coordinates": location,
-                "food_data": food_data,
-                "recommendation": recommendation,
-                "config": config_clone,
+                "recommendation": recommendation
             }))
         } else {
             None
@@ -688,7 +752,8 @@ async fn main() -> std::io::Result<()> {
     // 启动Web服务器
     println!("\n🚀 启动Web API服务...");
     println!("📡 监听地址: http://127.0.0.1:8080");
-    println!("🔌 完整数据API: http://127.0.0.1:8080/api/ai");
+    println!("📍 位置美食API: http://127.0.0.1:8080/api/location-food");
+    println!("🤖 AI推荐API: http://127.0.0.1:8080/api/ai-recommendation");
     println!("📝 纯文本API: http://127.0.0.1:8080/api/ai/content");
     println!("🗺️ 地图API: http://127.0.0.1:8080/api/map");
     println!("🩺 健康检查: http://127.0.0.1:8080/health");
@@ -700,6 +765,7 @@ async fn main() -> std::io::Result<()> {
             .allowed_origin("http://127.0.0.1:5173") // 也允许 127.0.0.1
             .allowed_origin("http://121.40.25.117") // 允许前端域名
             .allowed_origin("http://localhost:3000")  // 常见的React开发端口
+            .allowed_origin("http://137.0.0.0:5173")
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
             .allowed_headers(vec!["Content-Type", "Authorization"])
             .max_age(3600);
@@ -708,7 +774,8 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_state.clone())
             .wrap(cors)  // 应用 CORS 中间件
             .wrap(middleware::Logger::default())
-            .service(food_recommendation_api)
+            .service(location_food_api)
+            .service(ai_recommendation_api)
             .service(ai_content_only)
             .service(get_map_api)
             .service(health_check)
